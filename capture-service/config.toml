@@ -1,0 +1,32 @@
+main_core = 0
+nb_memory_channels = 8
+
+[mempool]
+capacity  = 65536
+cache_size = 512
+
+[online]
+duration = 28800  
+nb_rxd       = 8192
+promiscuous  = true
+mtu          = 1500
+hardware_assist = false
+dpdk_supl_args = ["--socket-mem=1024,0"]
+
+
+[[online.ports]]
+device = "0000:05:00.0"
+cores  = [1, 2, 3]
+rx_queues = [0, 1, 2]  
+
+[conntrack]
+max_connections      = 5000000
+max_out_of_order     = 1000
+timeout_resolution   = 100
+udp_inactivity_timeout  = 60000
+tcp_inactivity_timeout  = 300000
+tcp_establish_timeout   = 5000
+
+[online.monitor.display]
+throughput    = true
+mempool_usage = true
