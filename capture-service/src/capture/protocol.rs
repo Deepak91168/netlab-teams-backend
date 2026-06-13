@@ -1,9 +1,14 @@
-//! # protocol.rs
+//! # capture/protocol.rs
 //!
-//! **What this file does:**
+//! **What this file does (SHARED / platform-agnostic):**
 //! RFC 7983 protocol demultiplexing — identifies the application-layer
 //! protocol carried inside a UDP payload, using the same byte-level checks
-//! and the same check ORDER as the original Python reference (`b_streaming.py`).
+//! and the same check ORDER as the original Teams reference implementation.
+//!
+//! The byte-level checks are *generic* (they describe the wire format of each
+//! protocol, not any particular conferencing vendor), so they live in the
+//! shared capture layer.  Each platform decides, in its own `handle_packet`,
+//! *which* of these protocols it actually cares about.
 //!
 //! The order matters because some byte ranges overlap between protocols:
 //!   1. STUN / TURN Channel Data  (checked first — most restrictive header)
@@ -13,11 +18,20 @@
 //!   5. RTP                       (version=2, PT 0-127)
 //!   6. UNKNOWN
 //!
-//! **Return values of `identify_protocol`:**
-//!   0 = UNKNOWN  1 = RTP  2 = RTCP  3 = STUN  4 = DTLS  5 = QUIC
-//!
 //! All functions are `#[inline(always)]` — they are called millions of times
 //! per second from the capture hot-path and must not generate call overhead.
+
+/// Application-layer protocol identified inside a UDP payload by RFC 7983
+/// demultiplexing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Protocol {
+    Unknown,
+    Rtp,
+    Rtcp,
+    Stun,
+    Dtls,
+    Quic,
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  Individual protocol checks
@@ -140,33 +154,25 @@ pub fn is_rtp_payload(payload: &[u8]) -> bool {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Identify the protocol of a UDP payload using RFC 7983 ordering.
-///
-/// Returns:
-/// - `0` = UNKNOWN
-/// - `1` = RTP
-/// - `2` = RTCP
-/// - `3` = STUN / TURN
-/// - `4` = DTLS
-/// - `5` = QUIC
 #[inline(always)]
-pub fn identify_protocol(payload: &[u8]) -> u8 {
+pub fn classify_protocol(payload: &[u8]) -> Protocol {
     if payload.is_empty() {
-        return 0;
+        return Protocol::Unknown;
     }
     if is_stun(payload) {
-        return 3;
+        return Protocol::Stun;
     }
     if is_dtls(payload) {
-        return 4;
+        return Protocol::Dtls;
     }
     if is_quic(payload) {
-        return 5;
+        return Protocol::Quic;
     }
     if is_rtcp(payload) {
-        return 2;
+        return Protocol::Rtcp;
     }
     if is_rtp_payload(payload) {
-        return 1;
+        return Protocol::Rtp;
     }
-    0
+    Protocol::Unknown
 }

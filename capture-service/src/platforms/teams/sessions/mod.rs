@@ -1,50 +1,31 @@
+//! # platforms/teams/sessions/
+//!
+//! **Teams-owned session identification, management and QoE export.**
+//!
+//! Unchanged from the original implementation except that the batch *queue* is
+//! no longer a process-global: it is created by the Teams platform and the
+//! receiver handed to [`session_worker`].  This keeps every platform's session
+//! layer fully isolated (Google Meet will own its own engine and queue).
+//!
+//! Pipeline (per Teams session, keyed by client IP):
+//!   batches of `RtpRecord` → [`SessionEngine`] → [`NetworkMetrics`] +
+//!   [`MediaMetrics`] → InfluxDB line protocol → exporter thread.
+
 pub mod media_metrics;
 pub mod network_metrics;
 
+use crate::channels::record::Batch;
 use crate::models::RtpRecord;
-use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, bounded};
+use crossbeam_channel::{bounded, Receiver, RecvTimeoutError, Sender};
 use media_metrics::MediaMetrics;
 use network_metrics::NetworkMetrics;
 use std::collections::HashMap;
 use std::env;
 use std::hash::{Hash, Hasher};
-use std::sync::OnceLock;
-use std::thread::JoinHandle;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-
-pub const BATCH_SIZE: usize = 5_000;
 
 const SESSION_TIMEOUT_NS: u64 = 120 * 1_000_000_000; // 120 seconds
 const BIN_SIZE_NS: u64 = 5 * 1_000_000_000; // 5 seconds
-
-pub struct Batch {
-    pub records: Vec<RtpRecord>,
-    pub seq: u64,
-}
-
-static BATCH_TX: OnceLock<Sender<Batch>> = OnceLock::new();
-
-pub fn init_batch_queue(capacity: usize) -> Receiver<Batch> {
-    let (tx, rx) = bounded::<Batch>(capacity);
-    BATCH_TX.set(tx).expect("Batch queue already initialised");
-    rx
-}
-
-pub fn push_batch(batch: Batch) -> bool {
-    match BATCH_TX.get() {
-        Some(tx) => tx.try_send(batch).is_ok(),
-        None => false,
-    }
-}
-
-pub fn push_shutdown_batch() {
-    if let Some(tx) = BATCH_TX.get() {
-        let _ = tx.send(Batch {
-            records: Vec::new(),
-            seq: 0,
-        });
-    }
-}
 
 struct SessionState {
     session_id: String,
@@ -64,7 +45,7 @@ struct InfluxConfig {
 pub struct SessionEngine {
     sessions: HashMap<String, SessionState>,
     influx_tx: Option<Sender<String>>,
-    influx_handle: Option<JoinHandle<()>>,
+    influx_handle: Option<std::thread::JoinHandle<()>>,
 }
 
 fn is_microsoft_ip(ip: &str) -> bool {
@@ -253,8 +234,11 @@ fn push_influx_line(influx_tx: Option<&Sender<String>>, line: String) {
     }
 }
 
+/// Teams session worker.  Drains the platform's batch queue, runs the session
+/// engine and exports QoE lines.  Exits on the empty-batch sentinel or on a
+/// disconnected queue.
 pub fn session_worker(rx: Receiver<Batch>) {
-    println!("[INFO] Session processor starting.");
+    println!("[INFO][teams] Session processor starting.");
     let mut engine = SessionEngine::new();
 
     loop {
@@ -309,7 +293,7 @@ fn influx_writer_thread(rx: Receiver<String>, config: InfluxConfig) {
         }
     }
 
-    println!("[INFO] InfluxDB writer exiting.");
+    println!("[INFO][teams] InfluxDB writer exiting.");
 }
 
 fn collect_payload(rx: &Receiver<String>) -> Option<String> {
@@ -341,9 +325,9 @@ fn collect_payload(rx: &Receiver<String>) -> Option<String> {
 }
 
 fn drain_without_export(rx: Receiver<String>) {
-    println!("[INFO] InfluxDB export disabled; printing metrics to terminal instead...");
+    println!("[INFO][teams] InfluxDB export disabled; printing metrics to terminal instead...");
     while let Ok(line) = rx.recv() {
-        println!("[METRICS] {}", line);
+        println!("[METRICS][teams] {}", line);
     }
-    println!("[INFO] Writer exiting.");
+    println!("[INFO][teams] Writer exiting.");
 }

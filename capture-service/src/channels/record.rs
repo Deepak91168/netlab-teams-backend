@@ -1,107 +1,128 @@
 //! # channels/record.rs
 //!
-//! **What this file does:**
-//! - Receives `RtpRecord`s from the capture cores via `RECORD_TX`
-//! - For every record:
-//!     1. Writes a CSV row immediately (unchanged from original)
-//!     2. Clones it into a `pending` accumulator for the session layer
-//! - Flushes `pending` as a `Batch` to the session queue under two conditions:
-//!     - **Size trigger** : `pending.len() >= BATCH_SIZE` (5 000 records)
-//!     - **Time trigger**  : 5 seconds have elapsed since the last flush,
-//!                           regardless of how many records accumulated
-//!   Whichever fires first wins.  The time trigger uses `recv_timeout` so no
-//!   extra ticker thread is needed.
-//! - On `Shutdown`, flushes whatever partial batch remains then exits.
+//! **SHARED, generic RTP-record sink.**
+//!
+//! Reusable infrastructure that every RTP-based platform needs:
+//!   1. writes each [`RtpRecord`] as a CSV row,
+//!   2. de-duplicates retransmitted RTP packets with a 64-entry sliding
+//!      window per SSRC,
+//!   3. accumulates surviving records into [`Batch`]es and forwards them to a
+//!      platform-supplied session queue (`batch_tx`).
+//!
+//! Everything that used to be Teams-specific has been parameterised:
+//!   - the **CSV path** is passed in,
+//!   - a **label** is used only for log lines,
+//!   - counters live in a per-instance [`RecordStats`] (shared via `Arc` with
+//!     the owning platform) instead of global atomics,
+//!   - batches are pushed to an injected `Sender<Batch>` rather than a global.
 //!
 //! ## Batching state-machine
 //!
-//! ```
+//! ```text
 //!  loop:
 //!    recv_timeout(BATCH_WINDOW)
 //!      ├── Ok(Record)  → write CSV, push to pending
 //!      │                 if pending.len() >= BATCH_SIZE → flush (size trigger)
 //!      ├── Err(Timeout)→ flush pending if non-empty     (time trigger, 5 s)
-//!      └── Ok(Shutdown)→ flush pending, break
+//!      └── Ok(Shutdown)→ flush pending, send sentinel, break
 //! ```
+//!
+//! ## Shutdown protocol with the session layer
+//! On shutdown the thread flushes any partial batch and then sends an **empty
+//! `Batch`** (zero records) as a sentinel.  Session workers treat an empty
+//! batch as "flush and stop".  A normal flush never produces an empty batch,
+//! so the sentinel is unambiguous.
 
 use crate::models::RtpRecord;
-use crate::sessions::{BATCH_SIZE, Batch, push_batch, push_shutdown_batch};
-use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, bounded};
+use crossbeam_channel::{bounded, Receiver, RecvTimeoutError, Sender};
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufWriter, Write};
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
+use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-// ─────────────────────────────────────────────────────────────────────────────
-//  Timing constant
-// ─────────────────────────────────────────────────────────────────────────────
+/// Records per full batch (size trigger).
+pub const BATCH_SIZE: usize = 5_000;
 
 /// Maximum time to wait before flushing a partial batch to the session queue.
-/// Whatever packets arrived in this window are sent immediately, even if the
-/// batch is smaller than `BATCH_SIZE`.
 const BATCH_WINDOW: Duration = Duration::from_secs(5);
 
-// ─────────────────────────────────────────────────────────────────────────────
-//  Counters
-// ─────────────────────────────────────────────────────────────────────────────
-static CSV_RECORDS: AtomicUsize = AtomicUsize::new(0); // rows written to CSV
-static RECORD_DROPS: AtomicUsize = AtomicUsize::new(0); // lost: inbound channel full
-static BATCH_DROPS: AtomicUsize = AtomicUsize::new(0); // lost: session queue full
-static DUPLICATE_RECORDS: AtomicUsize = AtomicUsize::new(0); // dropped RTP duplicates
-
-/// Total CSV rows written so far.
-pub fn csv_records() -> usize {
-    CSV_RECORDS.load(Ordering::Relaxed)
-}
-/// Records dropped because the inbound `RECORD_TX` channel was full.
-pub fn record_drops() -> usize {
-    RECORD_DROPS.load(Ordering::Relaxed)
-}
-/// Batches dropped because the session queue was full.
-pub fn batch_drops() -> usize {
-    BATCH_DROPS.load(Ordering::Relaxed)
-}
-/// Duplicate records dropped in the record thread.
-pub fn duplicate_records() -> usize {
-    DUPLICATE_RECORDS.load(Ordering::Relaxed)
-}
-/// Called from `process_packet` in main.rs on `try_send` failure.
-pub fn inc_record_drops() {
-    RECORD_DROPS.fetch_add(1, Ordering::Relaxed);
+/// A unit of work handed to a platform's session engine.
+///
+/// An empty `records` vector is the shutdown sentinel (see module docs).
+pub struct Batch {
+    pub records: Vec<RtpRecord>,
+    pub seq: u64,
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-//  Message type
-// ─────────────────────────────────────────────────────────────────────────────
+/// Per-instance counters for one record sink.  Shared (`Arc`) between the
+/// records thread that increments them and the platform that reports them.
+#[derive(Default)]
+pub struct RecordStats {
+    csv_records: AtomicUsize,       // rows written to CSV
+    record_drops: AtomicUsize,      // lost: inbound channel full
+    batch_drops: AtomicUsize,       // lost: session queue full
+    duplicate_records: AtomicUsize, // dropped RTP duplicates
+}
+
+impl RecordStats {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+    pub fn csv_records(&self) -> usize {
+        self.csv_records.load(Ordering::Relaxed)
+    }
+    pub fn record_drops(&self) -> usize {
+        self.record_drops.load(Ordering::Relaxed)
+    }
+    pub fn batch_drops(&self) -> usize {
+        self.batch_drops.load(Ordering::Relaxed)
+    }
+    pub fn duplicate_records(&self) -> usize {
+        self.duplicate_records.load(Ordering::Relaxed)
+    }
+    /// Called from the capture hot-path when the inbound channel is full.
+    pub fn inc_record_drops(&self) {
+        self.record_drops.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Messages sent from the capture cores to a records thread.
 pub enum RecordMessage {
     /// One parsed RTP record from the capture hot-path.
     Record(RtpRecord),
-    /// Sent once by `main` after the runtime stops — flush and exit.
+    /// Sent once by the owning platform on shutdown — flush and exit.
     Shutdown,
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-//  Global inbound sender
-// ─────────────────────────────────────────────────────────────────────────────
-pub static RECORD_TX: OnceLock<Sender<RecordMessage>> = OnceLock::new();
-
-/// Initialise the inbound record channel.  Call once from `main`.
-/// Returns the `Receiver` to move into `records_thread`.
-pub fn init_record_channel(capacity: usize) -> Receiver<RecordMessage> {
+/// Spawn a records thread.  Returns the inbound sender (store on the platform)
+/// and the thread's [`JoinHandle`].
+pub fn spawn_record_writer(
+    csv_path: impl Into<String>,
+    label: impl Into<String>,
+    capacity: usize,
+    batch_tx: Sender<Batch>,
+    stats: Arc<RecordStats>,
+) -> (Sender<RecordMessage>, JoinHandle<()>) {
     let (tx, rx) = bounded::<RecordMessage>(capacity);
-    RECORD_TX
-        .set(tx)
-        .expect("Record channel already initialised");
-    rx
+    let csv_path = csv_path.into();
+    let label = label.into();
+    let handle = thread::spawn(move || records_thread(rx, csv_path, label, batch_tx, stats));
+    (tx, handle)
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-//  Internal helper — move pending into a Batch and push to session queue
-//  Has no effect if pending is empty (common on a quiet 5-second window).
-// ─────────────────────────────────────────────────────────────────────────────
-fn flush_batch(pending: &mut Vec<RtpRecord>, seq: &mut u64, reason: &str) {
+/// Move `pending` into a [`Batch`] and push it to the session queue.
+/// No effect if `pending` is empty.
+fn flush_batch(
+    pending: &mut Vec<RtpRecord>,
+    seq: &mut u64,
+    reason: &str,
+    label: &str,
+    batch_tx: &Sender<Batch>,
+    stats: &RecordStats,
+) {
     if pending.is_empty() {
         return;
     }
@@ -110,23 +131,27 @@ fn flush_batch(pending: &mut Vec<RtpRecord>, seq: &mut u64, reason: &str) {
     let n = pending.len();
     let records = std::mem::replace(pending, Vec::with_capacity(BATCH_SIZE));
 
-    if push_batch(Batch { records, seq: *seq }) {
-        println!("[batch] #{} dispatched — {n} records ({reason})", *seq);
+    if batch_tx.try_send(Batch { records, seq: *seq }).is_ok() {
+        println!("[{label}][batch] #{} dispatched — {n} records ({reason})", *seq);
     } else {
-        BATCH_DROPS.fetch_add(1, Ordering::Relaxed);
+        stats.batch_drops.fetch_add(1, Ordering::Relaxed);
         eprintln!(
-            "[WARN] Session queue full — dropped batch #{} ({n} records, {reason})",
+            "[WARN][{label}] Session queue full — dropped batch #{} ({n} records, {reason})",
             *seq
         );
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-//  records_thread
-// ─────────────────────────────────────────────────────────────────────────────
-pub fn records_thread(rx: Receiver<RecordMessage>) {
-    // ── CSV writer (unchanged from original) ──────────────────────────────
-    let file = File::create("teams_rtp_records.csv").expect("Failed to create CSV file");
+fn records_thread(
+    rx: Receiver<RecordMessage>,
+    csv_path: String,
+    label: String,
+    batch_tx: Sender<Batch>,
+    stats: Arc<RecordStats>,
+) {
+    // ── CSV writer ────────────────────────────────────────────────────────
+    let file = File::create(&csv_path)
+        .unwrap_or_else(|e| panic!("Failed to create CSV file {csv_path}: {e}"));
     let mut writer = BufWriter::with_capacity(8 * 1024 * 1024, file);
     writeln!(
         writer,
@@ -190,11 +215,11 @@ pub fn records_thread(rx: Receiver<RecordMessage>) {
                 };
 
                 if is_duplicate {
-                    DUPLICATE_RECORDS.fetch_add(1, Ordering::Relaxed);
+                    stats.duplicate_records.fetch_add(1, Ordering::Relaxed);
                     continue; // Skip CSV and session batch for this duplicate
                 }
 
-                // 2. CSV row (original, unchanged)
+                // 2. CSV row
                 let _ = writeln!(
                     writer,
                     "{},{},{},{},{},{},{},{},0x{:08X},{},{},{},{}",
@@ -212,33 +237,68 @@ pub fn records_thread(rx: Receiver<RecordMessage>) {
                     r.payload_type,
                     if r.marker { 1 } else { 0 }
                 );
-                CSV_RECORDS.fetch_add(1, Ordering::Relaxed);
+                stats.csv_records.fetch_add(1, Ordering::Relaxed);
 
                 // 3. Accumulate for session layer
                 pending.push(r);
 
                 // Size trigger — batch is full, send immediately
                 if pending.len() >= BATCH_SIZE {
-                    flush_batch(&mut pending, &mut seq, "size limit");
+                    flush_batch(
+                        &mut pending,
+                        &mut seq,
+                        "size limit",
+                        &label,
+                        &batch_tx,
+                        &stats,
+                    );
                 }
             }
 
             // ── 5-second window elapsed — send whatever we have ───────────
             Err(RecvTimeoutError::Timeout) => {
-                flush_batch(&mut pending, &mut seq, "5s timeout");
+                flush_batch(
+                    &mut pending,
+                    &mut seq,
+                    "5s timeout",
+                    &label,
+                    &batch_tx,
+                    &stats,
+                );
             }
 
             // ── Shutdown — flush partial batch then exit ──────────────────
             Ok(RecordMessage::Shutdown) => {
-                flush_batch(&mut pending, &mut seq, "shutdown");
-                push_shutdown_batch();
+                flush_batch(
+                    &mut pending,
+                    &mut seq,
+                    "shutdown",
+                    &label,
+                    &batch_tx,
+                    &stats,
+                );
+                // Sentinel: empty batch tells the session worker to stop.
+                let _ = batch_tx.send(Batch {
+                    records: Vec::new(),
+                    seq: 0,
+                });
                 break;
             }
 
             // ── Sender dropped (should not happen before Shutdown) ────────
             Err(RecvTimeoutError::Disconnected) => {
-                flush_batch(&mut pending, &mut seq, "disconnected");
-                push_shutdown_batch();
+                flush_batch(
+                    &mut pending,
+                    &mut seq,
+                    "disconnected",
+                    &label,
+                    &batch_tx,
+                    &stats,
+                );
+                let _ = batch_tx.send(Batch {
+                    records: Vec::new(),
+                    seq: 0,
+                });
                 break;
             }
         }
@@ -246,8 +306,8 @@ pub fn records_thread(rx: Receiver<RecordMessage>) {
 
     let _ = writer.flush();
     println!(
-        "[INFO] Records thread exiting — {} batches dispatched, {} batch drops.",
+        "[INFO][{label}] Records thread exiting — {} batches dispatched, {} batch drops.",
         seq,
-        batch_drops()
+        stats.batch_drops()
     );
 }

@@ -1,20 +1,24 @@
 //! # channels/
 //!
-//! Two bounded MPSC channels that decouple the capture cores from I/O.
+//! **SHARED, generic I/O sinks** that decouple the capture cores from disk and
+//! from the session layer.  Both are now vendor-neutral and instantiated
+//! per-platform (each platform passes its own output paths and owns its own
+//! sender), so two platforms never contend for one file or one global channel.
 //!
-//! | Module   | Channel carries  | Writer thread    | Output file              |
-//! |----------|-----------------|------------------|--------------------------|
-//! | packet   | raw frame bytes | `writer_thread`  | teams_traffic_rtp.pcap   |
-//! | record   | parsed RtpRecord| `records_thread` | teams_rtp_records.csv    |
+//! | Module   | Channel carries  | Writer thread     | Output file (per platform)   |
+//! |----------|------------------|-------------------|------------------------------|
+//! | `pcap`   | raw frame bytes  | pcap writer       | `<platform>_traffic_rtp.pcap`|
+//! | `record` | parsed RtpRecord | records thread    | `<platform>_rtp_records.csv` |
 //!
-//! Both channels are initialised once in `main` via `init_*_channel()`.
-//! The sender halves are stored in `OnceLock` statics so the hot-path
-//! (`process_packet`) can reach them without passing references around.
+//! The record sink additionally performs SSRC de-duplication and batches
+//! surviving records onto a platform-supplied session queue.
 
-pub mod packet;
+pub mod pcap;
 pub mod record;
 
-pub use packet::{
-    CapturedPacket, MAX_PACKET_SIZE, Message, PACKET_TX, init_packet_channel, writer_thread,
+pub use pcap::{
+    spawn_pcap_writer, CapturedPacket, Message as PcapMessage, MAX_PACKET_SIZE,
 };
-pub use record::{RECORD_TX, RecordMessage, init_record_channel, records_thread};
+pub use record::{
+    spawn_record_writer, Batch, RecordMessage, RecordStats, BATCH_SIZE,
+};
